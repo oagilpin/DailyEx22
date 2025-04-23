@@ -1,0 +1,202 @@
+---
+project:
+  output-dir: docs
+  type: website
+title: "CSU ESS330 Daily Exercise 22"
+author: "Olivia Gilpin"
+date: "04-23-2025"
+format:
+  html:
+    output-file: index.html
+    self-contained: true
+    toc: true
+    toc-depth: 3
+    toc-location: left 
+---
+
+# CSU ESS330 Daily Exercise 22
+
+## Load Libraries
+```{r}
+library(tidyverse)   
+library(lubridate)   
+library(modeltime)   
+library(tidymodels)  
+library(dataRetrieval) 
+library(parsnip) 
+library(timetk)
+library(prophet)
+library(tsibble)
+library(dplyr)
+```
+### Assignment22
+```{r}
+set.seed(123)
+
+poudre_flow <- readNWISdv(siteNumber = "06752260",
+                          parameterCd = "00060",
+                          startDate = "2013-01-01",
+                          endDate = "2023-12-31") |>
+  renameNWISColumns() |>
+  mutate(Date = yearmonth(Date)) |>
+  group_by(Date) |>
+  summarise(Flow = mean(Flow))
+
+poudre_df <- poudre_flow |>
+  as_tibble() |>
+  mutate(Date = as.Date(paste(year(Date), month(Date), "01", sep = "-")))
+
+ggplot(poudre_df, aes(x = Date, y = Flow)) +
+  geom_line() +
+  labs(
+    title = "Poudre River Monthly Average Streamflow",
+    subtitle = "USGS Site 06752260",
+    y = "Flow (cubic feet per second)",
+    x = "Date"
+  ) +
+  theme_minimal()
+
+splits <- initial_time_split(poudre_df, prop = 0.8)
+
+prophet_model <- prophet_reg(
+  seasonality_yearly = TRUE,
+  seasonality_weekly = FALSE
+) |>
+  set_engine("prophet") |>
+  fit(Flow ~ Date, data = training(splits))
+
+arima_model <- arima_reg() |>
+  set_engine("auto_arima") |>
+  fit(Flow ~ Date, data = training(splits))
+
+models_tbl <- modeltime_table(
+  prophet_model,
+  arima_model
+)
+
+calibration_tbl <- models_tbl |>
+  modeltime_calibrate(testing(splits))
+
+accuracy_tbl <- calibration_tbl |>
+  modeltime_accuracy()
+print(accuracy_tbl)
+
+refit_tbl <- calibration_tbl |>
+  modeltime_refit(poudre_df)
+
+forecast_horizon <- 12
+
+future_dates <- poudre_df |>
+  future_frame(
+    .length_out = forecast_horizon,
+    .bind_data = TRUE
+  )
+
+forecast_tbl <- refit_tbl |>
+  modeltime_forecast(
+    new_data = future_dates,
+    actual_data = poudre_df
+  )
+
+forecast_plot <- forecast_tbl |>
+  plot_modeltime_forecast(
+    .interactive = FALSE,
+    .conf_interval_show = TRUE
+  ) +
+  labs(
+    title = "Poudre River Monthly Streamflow Forecast",
+    subtitle = "Next 12 Months",
+    y = "Flow (cubic feet per second)",
+    x = "Date"
+  ) +
+  theme_minimal()
+
+print(forecast_plot)
+
+forecast_start_date <- max(poudre_df$Date) + days(1)
+forecast_end_date <- forecast_start_date + months(12) - days(1)
+
+actual_daily <- readNWISdv(
+  siteNumbers = "06752260",
+  parameterCd = "00060",
+  startDate = forecast_start_date,
+  endDate = forecast_end_date
+)
+
+str(actual_daily)
+
+actual_monthly <- actual_daily %>%
+  renameNWISColumns() %>%
+  select(Date, Flow) %>%
+  mutate(Date = as.Date(Date)) %>%
+  group_by(year = year(Date), month = month(Date)) %>%
+  summarise(Flow = mean(Flow, na.rm = TRUE), .groups = "drop") %>%
+  mutate(Date = as.Date(paste(year, month, "01", sep = "-"))) %>%
+  select(Date, Flow)
+
+prophet_preds <- forecast_tbl %>%
+  filter(.model_id == 1, .index >= forecast_start_date) %>%
+  select(.index, .value) %>%
+  rename(Date = .index, Prophet_Pred = .value)
+
+arima_preds <- forecast_tbl %>%
+  filter(.model_id == 2, .index >= forecast_start_date) %>%
+  select(.index, .value) %>%
+  rename(Date = .index, ARIMA_Pred = .value)
+
+comparison_df <- actual_monthly %>%
+  left_join(prophet_preds, by = "Date") %>%
+  left_join(arima_preds, by = "Date") %>%
+  na.omit()  # Remove any missing values
+
+prophet_lm <- lm(Flow ~ Prophet_Pred, data = comparison_df)
+prophet_r2 <- summary(prophet_lm)$r.squared
+
+arima_lm <- lm(Flow ~ ARIMA_Pred, data = comparison_df)
+arima_r2 <- summary(arima_lm)$r.squared
+
+cat("Prophet Model R²:", round(prophet_r2, 3), "\n")
+cat("ARIMA Model R²:", round(arima_r2, 3), "\n")
+
+prophet_plot <- ggplot(comparison_df, aes(x = Prophet_Pred, y = Flow)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "Prophet Model: Predicted vs Observed Flow",
+    x = "Predicted Flow (cfs)",
+    y = "Observed Flow (cfs)",
+    subtitle = paste("R² =", round(prophet_r2, 3))
+  ) +
+  theme_minimal()
+
+arima_plot <- ggplot(comparison_df, aes(x = ARIMA_Pred, y = Flow)) +
+  geom_point(alpha = 0.7, size = 3) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", color = "red") +
+  geom_smooth(method = "lm", se = FALSE, color = "blue") +
+  labs(
+    title = "ARIMA Model: Predicted vs Observed Flow",
+    x = "Predicted Flow (cfs)",
+    y = "Observed Flow (cfs)",
+    subtitle = paste("R² =", round(arima_r2, 3))
+  ) +
+  theme_minimal()
+
+library(patchwork)
+combined_plot <- prophet_plot + arima_plot
+print(combined_plot)
+```
+###Compute the R2 value between the model predictions and the observed data using a linear model and report the meaning
+```{r}
+cat("\n\nInterpretation of R² values:\n")
+cat("R² represents the proportion of variance in the observed streamflow data that is explained by the model predictions.\n\n")
+cat("For the Prophet model, an R² of", round(prophet_r2, 3), "means that approximately", 
+    round(prophet_r2 * 100, 1), "% of the variance in the actual Poudre River streamflow is explained by the model.\n\n")
+cat("For the ARIMA model, an R² of", round(arima_r2, 3), "means that approximately", 
+    round(arima_r2 * 100, 1), "% of the variance in the actual Poudre River streamflow is explained by the model.\n\n")
+cat("The closer R² is to 1, the better the model predictions match the observed values.\n")
+cat("The model with the higher R² value (", ifelse(prophet_r2 > arima_r2, "Prophet", "ARIMA"), 
+    ") provides better predictions of Poudre River streamflow during the forecast period.\n")
+```
+
+
