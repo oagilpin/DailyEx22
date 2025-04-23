@@ -14,8 +14,6 @@ format:
     toc-location: left 
 ---
 
-# CSU ESS330 Daily Exercise 22
-
 ## Load Libraries
 ```{r}
 library(tidyverse)   
